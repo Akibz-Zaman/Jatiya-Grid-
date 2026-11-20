@@ -8,14 +8,18 @@ import {
   ShieldCheck,
   AlertTriangle,
   Clock,
+  Flame,
+  Thermometer,
   X,
 } from 'lucide-react';
-import { DivisionState, OperatingMode } from '../../engine/types';
+import { getThermalStyleForTemperature } from '../../engine/thermalHeatmap';
+import { DivisionState, DivisionWeatherReading, OperatingMode } from '../../engine/types';
 import { Substation3DPreview } from './Substation3DPreview';
 
 interface DivisionInspectorDrawerProps {
   division: DivisionState;
   mode: OperatingMode;
+  weatherReading?: DivisionWeatherReading;
   onClose: () => void;
 }
 
@@ -45,9 +49,13 @@ const SUBZONE_META = {
 export const DivisionInspectorDrawer: React.FC<DivisionInspectorDrawerProps> = ({
   division,
   mode,
+  weatherReading,
   onClose,
 }) => {
   const deltaPrefix = division.deltaPct > 0 ? '+' : '';
+  const thermalStyle = weatherReading
+    ? getThermalStyleForTemperature(weatherReading.temperatureC)
+    : null;
 
   return (
     <aside
@@ -113,6 +121,54 @@ export const DivisionInspectorDrawer: React.FC<DivisionInspectorDrawerProps> = (
             </div>
           </div>
         </div>
+
+        {/* Regional Thermal Pressure Strip */}
+        {weatherReading && thermalStyle && (
+          <div
+            className={`rounded-lg border px-3 py-2.5 flex items-center justify-between gap-3 ${
+              weatherReading.heatwaveAlert
+                ? 'bg-rose-50/80 border-rose-200'
+                : 'bg-slate-50 border-slate-200'
+            }`}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              {weatherReading.heatwaveAlert ? (
+                <Flame className="w-4 h-4 text-rose-600 shrink-0" />
+              ) : (
+                <Thermometer className="w-4 h-4 text-sky-600 shrink-0" />
+              )}
+              <div className="min-w-0">
+                <div className="text-[11px] font-semibold text-slate-900">
+                  {thermalStyle.pressureTier}
+                </div>
+                <div className="text-[10px] text-slate-500 font-mono tabular-nums">
+                  Feels {weatherReading.feelsLikeC.toFixed(1)}°C · RH {weatherReading.humidityPct}%
+                </div>
+              </div>
+            </div>
+            <div className="text-right shrink-0 font-mono tabular-nums">
+              <div
+                className={`text-sm font-bold ${
+                  weatherReading.heatwaveAlert ? 'text-rose-700' : 'text-slate-900'
+                }`}
+              >
+                {weatherReading.temperatureC.toFixed(1)}°C
+              </div>
+              <div
+                className={`text-[10px] font-semibold ${
+                  weatherReading.coolingLoadDeltaMW > 0
+                    ? 'text-amber-700'
+                    : weatherReading.coolingLoadDeltaMW < 0
+                      ? 'text-sky-700'
+                      : 'text-slate-500'
+                }`}
+              >
+                {weatherReading.coolingLoadDeltaMW > 0 ? '+' : ''}
+                {weatherReading.coolingLoadDeltaMW} MW cooling
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Generation Note */}
         <div className="text-xs text-slate-600 leading-relaxed">

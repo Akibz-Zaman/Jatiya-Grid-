@@ -3,7 +3,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { BANGLADESH_CENTER } from '../../engine/bangladeshData';
-import { CorridorFlowState, DivisionId, DivisionState } from '../../engine/types';
+import { getThermalStyleForTemperature, sampleThermalRgb } from '../../engine/thermalHeatmap';
+import {
+  CorridorFlowState,
+  DivisionId,
+  DivisionState,
+  WeatherFeedSnapshot,
+} from '../../engine/types';
 import {
   buildCompositeSubstationGroup,
   createSharedSubstationMaterials,
@@ -14,6 +20,8 @@ import {
 interface ThreeBangladeshGridMapProps {
   divisions: DivisionState[];
   corridors: CorridorFlowState[];
+  weather: WeatherFeedSnapshot;
+  showThermalOverlay: boolean;
   selectedDivisionId: DivisionId | null;
   onSelectDivision: (id: DivisionId) => void;
 }
@@ -65,9 +73,63 @@ const _packetMat4 = new THREE.Matrix4();
 const _targetCamPos = new THREE.Vector3();
 const _targetLookAt = new THREE.Vector3();
 
+// Paint an Inverse Distance Weighting (IDW) thermal heatmap across Bangladesh's world bounds
+function paintThermalCanvas(
+  ctx: CanvasRenderingContext2D,
+  size: number,
+  bounds: { minX: number; maxX: number; minZ: number; maxZ: number },
+  divisions: DivisionState[],
+  weather: WeatherFeedSnapshot,
+) {
+  const stations = divisions.map((div) => {
+    const w = geoToWorld(div.position.lat, div.position.lng);
+    const reading = weather.readings.find((r) => r.divisionId === div.id);
+    return {
+      x: w.x,
+      z: w.z,
+      tempC: reading ? reading.temperatureC : 31.4,
+    };
+  });
+
+  const img = ctx.createImageData(size, size);
+  const data = img.data;
+  const spanX = bounds.maxX - bounds.minX;
+  const spanZ = bounds.maxZ - bounds.minZ;
+
+  for (let py = 0; py < size; py++) {
+    // Canvas y=0 maps to shape top (north = minZ), y=size-1 maps to south = maxZ
+    const worldZ = bounds.minZ + (py / (size - 1)) * spanZ;
+    for (let px = 0; px < size; px++) {
+      const worldX = bounds.minX + (px / (size - 1)) * spanX;
+
+      let weightedTemp = 0;
+      let weightSum = 0;
+      for (let i = 0; i < stations.length; i++) {
+        const dx = worldX - stations[i].x;
+        const dz = worldZ - stations[i].z;
+        const d2 = dx * dx + dz * dz + 0.18;
+        const w = 1 / (d2 * d2);
+        weightedTemp += stations[i].tempC * w;
+        weightSum += w;
+      }
+
+      const tempC = weightedTemp / weightSum;
+      const [r, g, b] = sampleThermalRgb(tempC);
+      const idx = (py * size + px) * 4;
+      data[idx] = r;
+      data[idx + 1] = g;
+      data[idx + 2] = b;
+      data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
 export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
   divisions,
   corridors,
+  weather,
+  showThermalOverlay,
   selectedDivisionId,
   onSelectDivision,
 }) => {
@@ -77,13 +139,24 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
   // Refs to keep Three.js loop synced with React props without tearing down WebGL
   const divisionsRef = useRef(divisions);
   const corridorsRef = useRef(corridors);
+  const weatherRef = useRef(weather);
+  const showThermalRef = useRef(showThermalOverlay);
   const selectedIdRef = useRef<DivisionId | null>(selectedDivisionId);
   const accentMatsRef = useRef<Record<string, THREE.MeshStandardMaterial>>({});
   const corridorMatsRef = useRef<Record<string, THREE.MeshStandardMaterial>>({});
+  const thermalOverlayRef = useRef<{
+    canvas: HTMLCanvasElement;
+    texture: THREE.CanvasTexture;
+    mesh: THREE.Mesh;
+    bounds: { minX: number; maxX: number; minZ: number; maxZ: number };
+    rings: Record<string, THREE.Mesh>;
+  } | null>(null);
   const flyTargetRef = useRef<{ pos: THREE.Vector3; look: THREE.Vector3 } | null>(null);
 
   divisionsRef.current = divisions;
   corridorsRef.current = corridors;
+  weatherRef.current = weather;
+  showThermalRef.current = showThermalOverlay;
   selectedIdRef.current = selectedDivisionId;
 
   // Trigger smooth damped camera transition whenever selectedDivisionId changes
@@ -125,6 +198,33 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
       }
     }
   }, [divisions, corridors]);
+
+  // Repaint the draped 3D thermal heatmap texture & substation thermal halos whenever weather or toggle updates
+  useEffect(() => {
+    const overlay = thermalOverlayRef.current;
+    if (!overlay) return;
+
+    overlay.mesh.visible = showThermalOverlay;
+    const ctx = overlay.canvas.getContext('2d');
+    if (ctx && showThermalOverlay) {
+      paintThermalCanvas(ctx, overlay.canvas.width, overlay.bounds, divisions, weather);
+      overlay.texture.needsUpdate = true;
+    }
+
+    for (const reading of weather.readings) {
+      const ring = overlay.rings[reading.divisionId];
+      if (!ring) continue;
+      ring.visible = showThermalOverlay && reading.temperatureC >= 34.5;
+      if (ring.visible) {
+        const style = getThermalStyleForTemperature(reading.temperatureC);
+        const mat = ring.material as THREE.MeshBasicMaterial;
+        mat.color.set(style.fillHex);
+        mat.opacity = reading.heatwaveAlert ? 0.55 : 0.35;
+        const scale = reading.heatwaveAlert ? 1.32 : 1.0;
+        ring.scale.set(scale, scale, 1);
+      }
+    }
+  }, [weather, showThermalOverlay, divisions]);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -250,6 +350,60 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
     disposableGeos.push(bdGeo);
     disposableMats.push(bdMat);
 
+    // Draped Procedural Thermal Heatmap Layer aligned cleanly to Bangladesh's terrain footprint
+    const thermalGeo = new THREE.ShapeGeometry(bdShape, 12);
+    thermalGeo.rotateX(-Math.PI / 2);
+    thermalGeo.computeBoundingBox();
+    const bbox = thermalGeo.boundingBox!;
+    const bounds = {
+      minX: bbox.min.x,
+      maxX: bbox.max.x,
+      minZ: bbox.min.z,
+      maxZ: bbox.max.z,
+    };
+
+    // Normalize planar UVs across the landmass bounding box (u: West->East, v: South->North)
+    const posAttr = thermalGeo.attributes.position;
+    const uvArray = new Float32Array(posAttr.count * 2);
+    const spanX = Math.max(0.001, bounds.maxX - bounds.minX);
+    const spanZ = Math.max(0.001, bounds.maxZ - bounds.minZ);
+    for (let i = 0; i < posAttr.count; i++) {
+      const vx = posAttr.getX(i);
+      const vz = posAttr.getZ(i);
+      uvArray[i * 2] = (vx - bounds.minX) / spanX;
+      // flipY=true on CanvasTexture puts canvas y=0 (north/minZ) at v=1
+      uvArray[i * 2 + 1] = 1 - (vz - bounds.minZ) / spanZ;
+    }
+    thermalGeo.setAttribute('uv', new THREE.BufferAttribute(uvArray, 2));
+
+    const thermalCanvas = document.createElement('canvas');
+    thermalCanvas.width = 160;
+    thermalCanvas.height = 160;
+    const thermalCtx = thermalCanvas.getContext('2d');
+    if (thermalCtx) {
+      paintThermalCanvas(thermalCtx, 160, bounds, divisionsRef.current, weatherRef.current);
+    }
+    const thermalTexture = new THREE.CanvasTexture(thermalCanvas);
+    thermalTexture.colorSpace = THREE.SRGBColorSpace;
+    thermalTexture.minFilter = THREE.LinearFilter;
+    thermalTexture.magFilter = THREE.LinearFilter;
+    thermalTexture.needsUpdate = true;
+
+    const thermalMat = new THREE.MeshStandardMaterial({
+      map: thermalTexture,
+      transparent: true,
+      opacity: 0.62,
+      roughness: 0.88,
+      metalness: 0.02,
+      depthWrite: false,
+    });
+    const thermalMesh = new THREE.Mesh(thermalGeo, thermalMat);
+    thermalMesh.position.y = 0.273;
+    thermalMesh.visible = showThermalRef.current;
+    scene.add(thermalMesh);
+    disposableGeos.push(thermalGeo);
+    disposableMats.push(thermalMat);
+
     // Crisp architectural national border rim
     const borderPoints = BANGLADESH_OUTLINE_GEO.map(([lat, lng]) => {
       const { x, z } = geoToWorld(lat, lng);
@@ -309,9 +463,12 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
       disposableGeos.push(rGeo);
     }
 
-    // Build all 8 Composite 3D Electrical Substation Complexes
+    // Build all 8 Composite 3D Electrical Substation Complexes + Thermal Pressure Halos
     const sharedMats = createSharedSubstationMaterials(renderer.capabilities.getMaxAnisotropy());
     const stationAnchors: Record<string, THREE.Vector3> = {};
+    const thermalRings: Record<string, THREE.Mesh> = {};
+    const sharedRingGeo = new THREE.RingGeometry(0.92, 1.28, 32);
+    disposableGeos.push(sharedRingGeo);
 
     for (const div of divisionsRef.current) {
       const { x, z } = geoToWorld(div.position.lat, div.position.lng);
@@ -328,7 +485,33 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
       disposableMats.push(accentMat);
       disposableGeos.push(...geometries);
       stationAnchors[div.id] = new THREE.Vector3(x, 1.55, z);
+
+      const reading = weatherRef.current.readings.find((r) => r.divisionId === div.id);
+      const style = getThermalStyleForTemperature(reading ? reading.temperatureC : 31.4);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: style.fillHex,
+        transparent: true,
+        opacity: reading?.heatwaveAlert ? 0.55 : 0.35,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const ringMesh = new THREE.Mesh(sharedRingGeo, ringMat);
+      ringMesh.rotation.x = -Math.PI / 2;
+      ringMesh.position.set(x, 0.278, z);
+      ringMesh.visible = Boolean(showThermalRef.current && reading && reading.temperatureC >= 34.5);
+      if (reading?.heatwaveAlert) ringMesh.scale.set(1.32, 1.32, 1);
+      scene.add(ringMesh);
+      disposableMats.push(ringMat);
+      thermalRings[div.id] = ringMesh;
     }
+
+    thermalOverlayRef.current = {
+      canvas: thermalCanvas,
+      texture: thermalTexture,
+      mesh: thermalMesh,
+      bounds,
+      rings: thermalRings,
+    };
 
     // Build 10 High-Voltage Transmission Corridor Curves + InstancedMesh Energy Flow Packets
     interface AnimatedCorridorCurve {
@@ -503,6 +686,8 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
       controls.dispose();
       disposableGeos.forEach((g) => g.dispose());
       disposableMats.forEach((m) => m.dispose());
+      thermalTexture.dispose();
+      thermalOverlayRef.current = null;
       sharedMats.dispose();
       envTarget.dispose();
       renderer.dispose();
@@ -523,6 +708,7 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
       <div className="pointer-events-none absolute inset-0 overflow-hidden z-10">
         {divisions.map((div) => {
           const isSelected = selectedDivisionId === div.id;
+          const weatherReading = weather.readings.find((r) => r.divisionId === div.id);
           const deltaPrefix = div.deltaPct > 0 ? '+' : '';
           const statusColor =
             div.status === 'critical'
@@ -553,9 +739,28 @@ export const ThreeBangladeshGridMap: React.FC<ThreeBangladeshGridMapProps> = ({
                   {div.allocatedMW.toLocaleString()} MW
                 </span>
               </div>
-              <div className={`font-mono text-[11px] font-semibold tabular-nums whitespace-nowrap ${statusColor.split(' ')[0]}`}>
-                {div.supplyPct.toFixed(1)}% ({deltaPrefix}
-                {div.deltaPct.toFixed(1)}%)
+              <div className="flex items-center justify-between gap-2 whitespace-nowrap">
+                <span
+                  className={`font-mono text-[11px] font-semibold tabular-nums ${statusColor.split(' ')[0]}`}
+                >
+                  {div.supplyPct.toFixed(1)}% ({deltaPrefix}
+                  {div.deltaPct.toFixed(1)}%)
+                </span>
+                {showThermalOverlay && weatherReading && (
+                  <span
+                    className={`font-mono text-[10px] font-bold tabular-nums ${
+                      weatherReading.heatwaveAlert
+                        ? 'text-rose-700'
+                        : weatherReading.temperatureC >= 34.5
+                          ? 'text-amber-700'
+                          : weatherReading.temperatureC < 29
+                            ? 'text-sky-700'
+                            : 'text-slate-600'
+                    }`}
+                  >
+                    {weatherReading.temperatureC.toFixed(1)}°C
+                  </span>
+                )}
               </div>
             </button>
           );

@@ -9,13 +9,22 @@ import {
 } from '@vis.gl/react-google-maps';
 import { Building2, Factory, Hospital, Home } from 'lucide-react';
 import { BANGLADESH_CENTER } from '../../engine/bangladeshData';
-import { CorridorFlowState, DivisionId, DivisionState, SubZoneState } from '../../engine/types';
+import { computeDivisionThermalZones } from '../../engine/thermalHeatmap';
+import {
+  CorridorFlowState,
+  DivisionId,
+  DivisionState,
+  SubZoneState,
+  WeatherFeedSnapshot,
+} from '../../engine/types';
 import { SubstationIconSvg } from './SubstationIconSvg';
 
 interface GoogleBangladeshMapProps {
   apiKey: string;
   divisions: DivisionState[];
   corridors: CorridorFlowState[];
+  weather: WeatherFeedSnapshot;
+  showThermalOverlay: boolean;
   selectedDivisionId: DivisionId | null;
   onSelectDivision: (id: DivisionId) => void;
 }
@@ -34,12 +43,24 @@ const SUBZONE_ICON_MAP = {
 const MapCameraAndCorridors: React.FC<{
   divisions: DivisionState[];
   corridors: CorridorFlowState[];
+  weather: WeatherFeedSnapshot;
+  showThermalOverlay: boolean;
   selectedDivisionId: DivisionId | null;
-}> = ({ divisions, corridors, selectedDivisionId }) => {
+  onSelectDivision: (id: DivisionId) => void;
+}> = ({
+  divisions,
+  corridors,
+  weather,
+  showThermalOverlay,
+  selectedDivisionId,
+  onSelectDivision,
+}) => {
   const map = useMap();
   const mapsLib = useMapsLibrary('maps');
   const polylinesRef = useRef<google.maps.Polyline[]>([]);
   const feederLinesRef = useRef<google.maps.Polyline[]>([]);
+  const thermalPolygonsRef = useRef<google.maps.Polygon[]>([]);
+  const thermalCirclesRef = useRef<google.maps.Circle[]>([]);
 
   // Smooth pan & zoom transition when selected division changes
   useEffect(() => {
@@ -158,6 +179,70 @@ const MapCameraAndCorridors: React.FC<{
     };
   }, [map, mapsLib, divisions, selectedDivisionId]);
 
+  // Render dynamic 8-division thermal heatmap polygons + elevated thermal pressure radial halos
+  useEffect(() => {
+    if (!map || !mapsLib) return;
+
+    thermalPolygonsRef.current.forEach((p) => p.setMap(null));
+    thermalPolygonsRef.current = [];
+    thermalCirclesRef.current.forEach((c) => c.setMap(null));
+    thermalCirclesRef.current = [];
+
+    if (!showThermalOverlay) return;
+
+    const zones = computeDivisionThermalZones(weather);
+    const zoomOpacityScale = selectedDivisionId ? 0.55 : 1.0;
+
+    const createdPolys: google.maps.Polygon[] = [];
+    const createdCircles: google.maps.Circle[] = [];
+
+    for (const zone of zones) {
+      const isSelected = selectedDivisionId === zone.divisionId;
+      const poly = new mapsLib.Polygon({
+        paths: zone.polygon,
+        strokeColor: isSelected ? '#0F172A' : zone.style.strokeHex,
+        strokeOpacity: isSelected ? 0.85 : 0.65,
+        strokeWeight: isSelected ? 2.2 : 1.35,
+        fillColor: zone.style.fillHex,
+        fillOpacity: zone.style.fillOpacity * zoomOpacityScale,
+        clickable: true,
+        zIndex: isSelected ? 18 : 10,
+        map,
+      });
+
+      poly.addListener('click', () => {
+        onSelectDivision(zone.divisionId);
+      });
+      createdPolys.push(poly);
+
+      // Add soft concentric thermal intensity core for warm / heatwave demand pressure zones
+      const div = divisions.find((d) => d.id === zone.divisionId);
+      if (div && zone.temperatureC >= 34.5) {
+        const coreCircle = new mapsLib.Circle({
+          center: div.position,
+          radius: zone.hotspotRadiusMeters,
+          strokeWeight: 0,
+          fillColor: zone.style.fillHex,
+          fillOpacity: (zone.heatwaveAlert ? 0.24 : 0.14) * zoomOpacityScale,
+          clickable: false,
+          zIndex: 14,
+          map,
+        });
+        createdCircles.push(coreCircle);
+      }
+    }
+
+    thermalPolygonsRef.current = createdPolys;
+    thermalCirclesRef.current = createdCircles;
+
+    return () => {
+      thermalPolygonsRef.current.forEach((p) => p.setMap(null));
+      thermalPolygonsRef.current = [];
+      thermalCirclesRef.current.forEach((c) => c.setMap(null));
+      thermalCirclesRef.current = [];
+    };
+  }, [map, mapsLib, weather, showThermalOverlay, divisions, selectedDivisionId, onSelectDivision]);
+
   return null;
 };
 
@@ -192,6 +277,8 @@ export const GoogleBangladeshMap: React.FC<GoogleBangladeshMapProps> = ({
   apiKey,
   divisions,
   corridors,
+  weather,
+  showThermalOverlay,
   selectedDivisionId,
   onSelectDivision,
 }) => {
@@ -221,11 +308,15 @@ export const GoogleBangladeshMap: React.FC<GoogleBangladeshMapProps> = ({
           <MapCameraAndCorridors
             divisions={divisions}
             corridors={corridors}
+            weather={weather}
+            showThermalOverlay={showThermalOverlay}
             selectedDivisionId={selectedDivisionId}
+            onSelectDivision={onSelectDivision}
           />
 
           {sortedDivisions.map((div, index) => {
             const isSelected = selectedDivisionId === div.id;
+            const weatherReading = weather.readings.find((r) => r.divisionId === div.id);
             const deltaPrefix = div.deltaPct > 0 ? '+' : '';
             const pctTextColor =
               div.status === 'critical'
@@ -246,9 +337,9 @@ export const GoogleBangladeshMap: React.FC<GoogleBangladeshMapProps> = ({
 
             const badgeOffsetClass =
               div.id === 'khulna'
-                ? '-translate-x-5'
+                ? '-translate-x-9'
                 : div.id === 'barishal'
-                  ? 'translate-x-5'
+                  ? 'translate-x-8'
                   : '';
 
             return (
@@ -277,11 +368,28 @@ export const GoogleBangladeshMap: React.FC<GoogleBangladeshMapProps> = ({
                         {div.allocatedMW.toLocaleString()} MW
                       </span>
                     </div>
-                    <div
-                      className={`mt-0.5 font-mono text-[10.5px] font-bold tabular-nums leading-none whitespace-nowrap ${pctTextColor}`}
-                    >
-                      {div.supplyPct.toFixed(1)}% ({deltaPrefix}
-                      {div.deltaPct.toFixed(1)}%)
+                    <div className="mt-0.5 flex items-center justify-between gap-2 whitespace-nowrap">
+                      <span
+                        className={`font-mono text-[10.5px] font-bold tabular-nums leading-none ${pctTextColor}`}
+                      >
+                        {div.supplyPct.toFixed(1)}% ({deltaPrefix}
+                        {div.deltaPct.toFixed(1)}%)
+                      </span>
+                      {showThermalOverlay && weatherReading && (
+                        <span
+                          className={`font-mono text-[10px] font-bold tabular-nums leading-none ${
+                            weatherReading.heatwaveAlert
+                              ? 'text-rose-700'
+                              : weatherReading.temperatureC >= 34.5
+                                ? 'text-amber-700'
+                                : weatherReading.temperatureC < 29
+                                  ? 'text-sky-700'
+                                  : 'text-slate-600'
+                          }`}
+                        >
+                          {weatherReading.temperatureC.toFixed(1)}°C
+                        </span>
+                      )}
                     </div>
                   </div>
 

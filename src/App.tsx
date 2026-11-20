@@ -280,9 +280,12 @@ export default function App() {
               <GridMapView
                 controls={controls}
                 snapshot={snapshot}
+                weather={weather}
                 selectedDivisionId={selectedDivisionId}
                 onSelectDivision={setSelectedDivisionId}
                 onSelectScenario={handleSelectScenario}
+                onSelectWeatherProfile={handleSelectWeatherProfile}
+                onOpenWeatherFeed={handleOpenWeatherFeed}
                 mapsApiKey={ENV_MAPS_API_KEY}
                 mapEngine={mapEngine}
                 onChangeMapEngine={setMapEngine}
